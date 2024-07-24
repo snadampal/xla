@@ -117,6 +117,7 @@ HeapSimulator::Chunk Allocation::chunk() const {
 void Allocation::set_offset(int64_t offset) {
   CHECK(chunk_.has_value());
   *chunk_ = HeapSimulator::Chunk::FromOffsetSize(offset, chunk_->size);
+  NotifyObservers();
 }
 
 bool Allocation::is_in_alternate_mem() const {
@@ -155,6 +156,7 @@ void Allocation::AddUse(HloUse use) {
   operand = get_simplified_operand(operand);
 
   uses_.push_back(use);
+  NotifyObservers();
 }
 
 absl::Status Allocation::UpdateUses(HloComputation* computation,
@@ -182,6 +184,7 @@ absl::Status Allocation::UpdateUses(HloComputation* computation,
     TF_RETURN_IF_ERROR(use.instruction->ReplaceOperandWith(
         use.operand_number, replacement_instruction));
   }
+  NotifyObservers();
   return absl::OkStatus();
 }
 
@@ -203,14 +206,16 @@ Allocation::Allocation(HloPosition defining_position, MemorySpace memory_space,
                        std::optional<HeapSimulator::Chunk> chunk,
                        int64_t start_time, int64_t end_time,
                        bool is_scoped_allocation,
-                       std::optional<int64_t> cross_program_prefetch_index)
+                       std::optional<int64_t> cross_program_prefetch_index,
+                       bool is_representative)
     : original_defining_position_(std::move(defining_position)),
       memory_space_(memory_space),
       chunk_(chunk),
       start_time_(start_time),
       end_time_(end_time),
       is_scoped_allocation_(is_scoped_allocation),
-      cross_program_prefetch_index_(cross_program_prefetch_index) {
+      cross_program_prefetch_index_(cross_program_prefetch_index),
+      is_representative_(is_representative) {
   CHECK(!is_scoped_allocation ||
         original_defining_position_.index == ShapeIndex({}));
 }
@@ -221,6 +226,8 @@ HloPosition Allocation::original_defining_position() const {
 
 void Allocation::set_original_defining_position(HloPosition defining_position) {
   original_defining_position_ = std::move(defining_position);
+  VLOG(3) << "Set original_defining_position_ to "
+          << original_defining_position_.ToString();
 }
 
 bool Allocation::base_is_equal(const Allocation& other) const {
@@ -303,16 +310,20 @@ CopyAllocation::CopyAllocation(
     std::optional<HeapSimulator::Chunk> chunk,
     int64_t copy_start_schedule_after_time,
     int64_t copy_done_schedule_before_time, int64_t end_time,
-    std::optional<int64_t> cross_program_prefetch_index)
+    std::optional<int64_t> cross_program_prefetch_index, bool is_async_slice,
+    HloInstruction* sync_instruction, bool is_representative)
     : Allocation(
           /*defining_position=*/{nullptr, {}}, memory_space, chunk,
           // Allocation uses an inclusive start time
           ExclusiveToInclusiveStartTime(copy_start_schedule_after_time),
           end_time,
-          /*is_scoped_allocation=*/false, cross_program_prefetch_index),
+          /*is_scoped_allocation=*/false, cross_program_prefetch_index,
+          is_representative),
       prev_allocation_(prev_allocation),
       copy_start_schedule_after_(copy_start_schedule_after_time),
-      copy_done_schedule_before_(copy_done_schedule_before_time) {}
+      copy_done_schedule_before_(copy_done_schedule_before_time),
+      is_async_slice_(is_async_slice),
+      sync_instruction_(sync_instruction) {}
 
 int64_t CopyAllocation::earliest_available_time() const {
   return copy_done_schedule_before_;
@@ -323,11 +334,21 @@ absl::Status CopyAllocation::Process() {
   Shape shape = defining_position().shape();
   HloInstruction* producing_instruction = AddGetTupleElements();
   HloComputation* computation = producing_instruction->parent();
-  copy_start_ = computation->AddInstruction(HloInstruction::CreateCopyStart(
-      ShapeUtil::MakeTupleShape({shape, shape, ShapeUtil::MakeShape(U32, {})}),
-      producing_instruction, cross_program_prefetch_index()));
-  copy_done_ = computation->AddInstruction(
-      HloInstruction::CreateUnary(shape, HloOpcode::kCopyDone, copy_start_));
+  if (is_async_slice_) {
+    CHECK(sync_instruction_->opcode() == HloOpcode::kSlice);
+    TF_ASSIGN_OR_RETURN(copy_done_,
+                        computation->CreateAsyncInstructions(
+                            sync_instruction_, {ShapeUtil::MakeShape(S32, {})},
+                            HloInstruction::kMainExecutionThread, false));
+    copy_start_ = copy_done_->mutable_operand(0);
+  } else {
+    copy_start_ = computation->AddInstruction(HloInstruction::CreateCopyStart(
+        ShapeUtil::MakeTupleShape(
+            {shape, shape, ShapeUtil::MakeShape(U32, {})}),
+        producing_instruction, cross_program_prefetch_index()));
+    copy_done_ = computation->AddInstruction(
+        HloInstruction::CreateUnary(shape, HloOpcode::kCopyDone, copy_start_));
+  }
   VLOG(4) << "Created " << copy_start_->name()
           << " for copy allocation: " << ToString();
 
@@ -359,7 +380,8 @@ std::string CopyAllocation::ToString() const {
                       ", start_time:", start_time(), ", end_time:", end_time(),
                       ", copy_start_after_time: ", copy_start_schedule_after(),
                       ", copy_done_before_time: ", copy_done_schedule_before(),
-                      ", uses: ", UsesToString(uses()), ", from ",
+                      ", uses: ", UsesToString(uses()),
+                      ", is_async_slice: ", is_async_slice(), ", from ",
                       prev_allocation_.ToString());
 }
 
@@ -380,7 +402,9 @@ bool CopyAllocation::operator==(const CopyAllocation& other) const {
   return this->base_is_equal(static_cast<const Allocation&>(other)) &&
          copy_done_schedule_before() == other.copy_done_schedule_before() &&
          copy_start_schedule_after() == other.copy_start_schedule_after() &&
-         copy_start() == other.copy_start() && copy_done() == other.copy_done();
+         copy_start() == other.copy_start() &&
+         copy_done() == other.copy_done() &&
+         is_async_slice() == other.is_async_slice();
 }
 
 bool CopyAllocation::operator==(const Allocation& other) const {

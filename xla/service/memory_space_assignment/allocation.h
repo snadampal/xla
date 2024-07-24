@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef XLA_SERVICE_MEMORY_SPACE_ASSIGNMENT_ALLOCATION_H_
 #define XLA_SERVICE_MEMORY_SPACE_ASSIGNMENT_ALLOCATION_H_
 
+#include <stdbool.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -27,6 +29,7 @@ limitations under the License.
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/functional/function_ref.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -96,7 +99,10 @@ class Allocation {
   void set_start_time(int64_t start_time) { start_time_ = start_time; }
   void set_end_time(int64_t end_time) { end_time_ = end_time; }
   // Extends the end time of this allocation.
-  void Extend(int64_t end_time) { end_time_ = std::max(end_time_, end_time); }
+  void Extend(int64_t end_time) {
+    end_time_ = std::max(end_time_, end_time);
+    NotifyObservers();
+  }
 
   // Allocation space methods
   // --------------------------------------------------------------------------
@@ -134,7 +140,6 @@ class Allocation {
   virtual bool is_window_prefetched_allocation() const = 0;
   // True if the allocation is for a copy or a sliced-copy.
   bool is_copy_like_allocation() const;
-
   // Processing methods
   // --------------------------------------------------------------------------
   // Recursively create kGetTupleElement instructions if the defining position
@@ -161,6 +166,9 @@ class Allocation {
   // --------------------------------------------------------------------------
   virtual std::string ToString() const = 0;
   virtual bool operator==(const Allocation& other) const = 0;
+  void AddObserver(std::function<void()> observer) {
+    observers_.push_back(observer);
+  }
 
  protected:
   // Protected constructor to encourage use of the final subclasses (e.g.,
@@ -168,7 +176,8 @@ class Allocation {
   Allocation(HloPosition defining_position, MemorySpace memory_space,
              std::optional<HeapSimulator::Chunk> chunk, int64_t start_time,
              int64_t end_time, bool is_scoped_allocation,
-             std::optional<int64_t> cross_program_prefetch_index);
+             std::optional<int64_t> cross_program_prefetch_index,
+             bool is_representative = true);
 
   // Returns the original defining position of this allocation.
   HloPosition original_defining_position() const;
@@ -177,6 +186,13 @@ class Allocation {
   bool base_is_equal(const Allocation& other) const;
 
  private:
+  void NotifyObservers() {
+    for (const auto& observer : observers_) {
+      observer();
+    }
+  }
+
+  std::vector<std::function<void()>> observers_;
   HloPosition original_defining_position_;
   MemorySpace memory_space_;
   std::optional<HeapSimulator::Chunk> chunk_;
@@ -185,9 +201,46 @@ class Allocation {
   const bool is_scoped_allocation_;
   std::vector<HloUse> uses_;
   std::optional<int64_t> cross_program_prefetch_index_;
+  bool is_representative_ = true;
 };
 
-using AllocationSequence = std::vector<std::unique_ptr<Allocation>>;
+class AllocationSequence : public std::vector<std::unique_ptr<Allocation>> {
+ public:
+  AllocationSequence(Allocation* starting_allocation = nullptr)
+      : starting_allocation_(starting_allocation) {}
+  Allocation* starting_allocation() const { return starting_allocation_; }
+  void set_starting_allocation(Allocation* starting_allocation) {
+    starting_allocation_ = starting_allocation;
+  }
+
+  void push_back(std::unique_ptr<Allocation>&& alloc) {
+    std::vector<std::unique_ptr<Allocation>>::push_back(std::move(alloc));
+    std::vector<std::unique_ptr<Allocation>>::back()->AddObserver(
+        [this,
+         alloc = std::vector<std::unique_ptr<Allocation>>::back().get()]() {
+          PrintAllocationValue(alloc, "Updated an allocation");
+        });
+    PrintAllocationValue(std::vector<std::unique_ptr<Allocation>>::back().get(),
+                         "Pushed back an allocation");
+  }
+
+ private:
+  void PrintAllocationValue(const Allocation* allocation,
+                            std::string notification_msg) const {
+    VLOG(3) << notification_msg << ": " << allocation->ToString();
+  }
+
+  void PrintValue() const {
+    VLOG(3) << "Updated AllocationSequence: ";
+
+    for (const auto& alloc : *this) {
+      VLOG(3) << alloc->ToString();
+    }
+  }
+
+  Allocation* starting_allocation_;
+};
+
 std::tuple<int64_t, bool, int64_t> GetAllocationSortTuple(
     const std::unique_ptr<Allocation>& allocation);
 void SortAllocationSequence(AllocationSequence& allocations);
@@ -240,7 +293,9 @@ class CopyAllocation final : public Allocation {
       std::optional<HeapSimulator::Chunk> chunk,
       int64_t copy_start_schedule_after_time,
       int64_t copy_done_schedule_before_time, int64_t end_time,
-      std::optional<int64_t> cross_program_prefetch_index = std::nullopt);
+      std::optional<int64_t> cross_program_prefetch_index = std::nullopt,
+      bool is_async_slice = false, HloInstruction* sync_instruction = nullptr,
+      bool is_representative = false);
 
   // Overridden methods
   //
@@ -252,6 +307,7 @@ class CopyAllocation final : public Allocation {
   bool is_pinned_allocation() const override { return false; }
   bool is_copy_allocation() const override { return true; }
   bool is_sliced_copy_allocation() const override { return false; }
+  bool is_async_slice() const { return is_async_slice_; }
   bool is_window_prefetched_allocation() const override { return false; }
   absl::Status Process() override;
   absl::Status PostProcess() override { return absl::OkStatus(); }
@@ -286,6 +342,8 @@ class CopyAllocation final : public Allocation {
   int64_t copy_done_schedule_before_;
   HloInstruction* copy_start_ = nullptr;
   HloInstruction* copy_done_ = nullptr;
+  bool is_async_slice_ = false;
+  HloInstruction* sync_instruction_ = nullptr;
 };
 
 // This class represents an allocation resulting from asynchronous sliced
