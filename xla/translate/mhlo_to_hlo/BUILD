@@ -63,9 +63,9 @@ cc_library(
 )
 
 cc_library(
-    name = "module_config_exporter",
-    srcs = ["module_config_exporter.cc"],
-    hdrs = ["module_config_exporter.h"],
+    name = "module_attributes_exporter",
+    srcs = ["module_attributes_exporter.cc"],
+    hdrs = ["module_attributes_exporter.h"],
     deps = [
         "//xla/service:hlo_module_config",
         "@llvm-project//mlir:IR",
@@ -93,7 +93,7 @@ cc_library(
         ":attribute_exporter",
         ":layout_util",
         ":location_exporter",
-        ":module_config_exporter",
+        ":module_attributes_exporter",
         ":operator_writer_inc",
         ":stack_frame_index_builder",
         ":type_to_shape",
@@ -118,6 +118,7 @@ cc_library(
         "//xla/mlir/utils:type_util",
         "//xla/mlir_hlo",
         "//xla/mlir_hlo:mhlo_passes",
+        "//xla/service:computation_layout",
         "//xla/service:hlo_module_config",
         "//xla/service:hlo_parser",
         "//xla/service:hlo_proto_cc",
