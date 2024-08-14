@@ -1183,6 +1183,49 @@ absl::StatusOr<std::vector<int64_t>> GetTensorDimToMeshDimNoCrash(
   return tensor_dim_to_device_dim;
 }
 
+std::vector<absl::flat_hash_set<int64_t>>
+GetTensorDimToMeshDimMixedMeshSharding(int64_t tensor_shape_rank,
+                                       const HloSharding& sharding,
+                                       const Array<int64_t>& device_mesh,
+                                       bool consider_reverse_device_meshes) {
+  CHECK(!sharding.IsReplicated());
+  // Check the compatibility of tensor_shape_rank and spec
+  if (tensor_shape_rank != sharding.TiledDataRank()) {
+    LOG(FATAL) << "Tensor shape rank should be equal to the tiled data rank of "
+                  "the input spec.";
+  }
+  if (!TileAssignmentMatchesMesh(sharding, device_mesh)) {
+    LOG(FATAL)
+        << "Device mesh and tile assignment need to have the same number of "
+           "sharded dims.";
+  }
+
+  absl::StatusOr<std::vector<int64_t>> axes =
+      GetMeshDimPermutationOrderInShardingSpec(sharding, device_mesh,
+                                               consider_reverse_device_meshes);
+  CHECK_OK(axes);
+
+  std::vector<absl::flat_hash_set<int64_t>> tensor_dim_to_mesh_axis_mapping;
+  int mesh_axis_idx = 0;
+  for (int i = 0; i < sharding.tile_assignment().num_dimensions(); ++i) {
+    if (sharding.tile_assignment().dim(i) == 1) {
+      tensor_dim_to_mesh_axis_mapping.push_back({-1});
+      continue;
+    }
+
+    absl::flat_hash_set<int64_t> mesh_axes_for_this_tensor_dim;
+    int product = 1;
+    do {
+      product *= device_mesh.dim((*axes)[mesh_axis_idx]);
+      mesh_axes_for_this_tensor_dim.insert((*axes)[mesh_axis_idx]);
+      mesh_axis_idx++;
+    } while (product < sharding.tile_assignment().dim(i));
+    CHECK(!mesh_axes_for_this_tensor_dim.empty());
+    tensor_dim_to_mesh_axis_mapping.push_back(mesh_axes_for_this_tensor_dim);
+  }
+  return tensor_dim_to_mesh_axis_mapping;
+}
+
 std::vector<int64_t> GetTensorDimToMeshDim(
     int64_t tensor_shape_rank, const HloSharding& spec,
     const Array<int64_t>& device_mesh, bool consider_reverse_device_meshes) {

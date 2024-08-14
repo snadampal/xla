@@ -427,6 +427,16 @@ absl::StatusOr<int64_t> CheckArithmeticSequence(
 bool TileAssignmentMatchesMesh(const HloSharding& spec,
                                const Array<int64_t>& mesh);
 
+absl::StatusOr<std::vector<int64_t>> GetMeshDimPermutationOrderInShardingSpec(
+    const HloSharding& spec, const Array<int64_t>& device_mesh,
+    bool consider_reverse_device_meshes);
+
+std::vector<absl::flat_hash_set<int64_t>>
+GetTensorDimToMeshDimMixedMeshSharding(
+    int64_t tensor_shape_rank, const HloSharding& sharding,
+    const Array<int64_t>& device_mesh,
+    bool consider_reverse_device_meshes = false);
+
 // Get the mapped mesh dimension for every tensor dimension.
 // The returned value maps ith tensor dim to one mesh dim. -1 means the tensor
 // is replicated on that dimension.

@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/hlo/experimental/auto_sharding/cluster_environment.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -23,9 +24,13 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
 #include "absl/types/span.h"
 #include "xla/hlo/experimental/auto_sharding/auto_sharding_strategy.h"
 #include "xla/hlo/experimental/auto_sharding/auto_sharding_util.h"
+#include "xla/hlo/ir/hlo_sharding.h"
 #include "xla/service/spmd/spmd_partitioner_util.h"
 #include "xla/shape.h"
 
@@ -133,29 +138,49 @@ double ClusterEnvironment::AllToAllCost(double num_bytes, int mesh_dim) const {
   return AllToAllCostUtil(num_bytes, mesh_dim, num_devices);
 }
 
+template <typename T>
+bool IsSubset(absl::flat_hash_set<T> superset, absl::flat_hash_set<T> subset) {
+  for (const T& element : subset) {
+    if (!superset.contains(element)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Do not consider device id changes yet.
 double ClusterEnvironment::ReshardingCostMixedMeshShape(
-    const Shape& shape, absl::Span<const int64_t> src_tensor_dim_to_mesh_dim,
-    absl::Span<const int64_t> dst_tensor_dim_to_mesh_dim) const {
+    const Shape& shape, const HloSharding& src_sharding,
+    const HloSharding& dst_sharding) const {
+  std::vector<absl::flat_hash_set<int64_t>> src_tensor_dim_to_mesh_axis =
+      GetTensorDimToMeshDimMixedMeshSharding(
+          shape.rank(), src_sharding, device_mesh_,
+          /*consider_reverse_device_meshes=*/true);
+  std::vector<absl::flat_hash_set<int64_t>> dst_tensor_dim_to_mesh_axis =
+      GetTensorDimToMeshDimMixedMeshSharding(
+          shape.rank(), dst_sharding, device_mesh_,
+          /*consider_reverse_device_meshes=*/true);
+
   int64_t num_devices = device_mesh_.num_elements();
   double resharding_costs = 0.0;
   for (size_t i = 0; i < shape.rank(); ++i) {
     // Only consider sharded dimensions, do not consider replicate_on_last_dim.
-    if (src_tensor_dim_to_mesh_dim[i] == dst_tensor_dim_to_mesh_dim[i]) {
+    if (src_tensor_dim_to_mesh_axis[i] == dst_tensor_dim_to_mesh_axis[i]) {
       continue;
     }
-    if (dst_tensor_dim_to_mesh_dim[i] == -1 ||
-        src_tensor_dim_to_mesh_dim[i] == -1) {
-      // AllToAll cost
-      int64_t communication_dim;
-      if (dst_tensor_dim_to_mesh_dim[i] != -1) {
-        communication_dim = dst_tensor_dim_to_mesh_dim[i];
-      } else {
-        communication_dim = src_tensor_dim_to_mesh_dim[i];
-      }
+    if (IsSubset(dst_tensor_dim_to_mesh_axis[i],
+                 src_tensor_dim_to_mesh_axis[i])) {
+      // do nothing; the src is sharded more than the dest
+    } else if (IsSubset(src_tensor_dim_to_mesh_axis[i],
+                        dst_tensor_dim_to_mesh_axis[i])) {
       int64_t communication_bytes = ByteSizeOfShape(shape);
-      resharding_costs +=
-          AllToAllCostUtil(communication_bytes, communication_dim, num_devices);
+      for (int64_t mesh_dim : src_tensor_dim_to_mesh_axis[i]) {
+        if (absl::c_find(dst_tensor_dim_to_mesh_axis[i], mesh_dim) !=
+            dst_tensor_dim_to_mesh_axis[i].end()) {
+          resharding_costs +=
+              AllToAllCostUtil(communication_bytes, mesh_dim, num_devices);
+        }
+      }
     } else {
       // Do not support this sharding, assuming it is gonna be very expensive.
       return kInfinityCost;
@@ -325,8 +350,7 @@ double ClusterEnvironment::ReshardingCost(const Shape& shape,
       dst_tensor_dim_to_mesh_dim_or.value();
 
   if (src_n_dim != dst_n_dim && src_n_dim != -1 && dst_n_dim != -1) {
-    return ReshardingCostMixedMeshShape(shape, src_tensor_dim_to_mesh_dim,
-                                        dst_tensor_dim_to_mesh_dim);
+    return ReshardingCostMixedMeshShape(shape, src_spec, dst_spec);
   }
 
   AdjustTensorMeshDimMapping(src_tensor_dim_to_mesh_dim, src_n_dim);
