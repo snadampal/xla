@@ -31,6 +31,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Support",
+        "@stablehlo//:base",
     ],
 )
 

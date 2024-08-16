@@ -34,6 +34,9 @@ namespace xla {
 ConvolutionDimensionNumbers ConvertConvDimensionNumbers(
     mlir::mhlo::ConvDimensionNumbersAttr input);
 
+absl::StatusOr<xla::PrecisionConfig::Algorithm> ConvertDotAlgorithm(
+    mlir::mhlo::DotAlgorithmAttr attr);
+
 absl::StatusOr<std::vector<ReplicaGroup>> ConvertReplicaGroups(
     mlir::DenseIntElementsAttr input);
 
