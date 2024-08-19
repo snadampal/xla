@@ -1002,6 +1002,40 @@ ENTRY main {
   EXPECT_EQ(triton_gemm_rewriter_has_run, expect_triton_gemm_rewriter_has_run);
 }
 
+TEST_F(GpuCompilerPassTest,
+       GpuCompilerRunsCustomKernelFusionByDefaultFromVolta) {
+  auto cc = backend()
+                .default_stream_executor()
+                ->GetDeviceDescription()
+                .cuda_compute_capability();
+
+  bool expect_custom_kernel_fusion_rewriter_has_run =
+      cc.major == se::CudaComputeCapability::VOLTA;
+
+  constexpr absl::string_view constant_module = R"(
+HloModule noop
+
+ENTRY main {
+  ROOT constant = f32[] constant(0)
+})";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(constant_module));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized_module,
+                          GetOptimizedModule(std::move(module)));
+  const HloModuleMetadataProto& module_metadata =
+      optimized_module->metadata()->proto();
+
+  bool custom_kernel_fusion_rewriter_has_run = false;
+  for (const HloPassMetadata& pass_metadata : module_metadata.pass_metadata()) {
+    custom_kernel_fusion_rewriter_has_run |=
+        pass_metadata.pass_name() == "custom-kernel-fusion-rewriter";
+  }
+
+  EXPECT_EQ(custom_kernel_fusion_rewriter_has_run,
+            expect_custom_kernel_fusion_rewriter_has_run);
+}
+
 }  // namespace
 }  // namespace gpu
 }  // namespace xla
