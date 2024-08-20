@@ -19,6 +19,7 @@ limitations under the License.
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -58,6 +59,7 @@ limitations under the License.
 #include "tsl/platform/env.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/logging.h"
+#include "tsl/platform/mutex.h"
 #include "tsl/platform/path.h"
 #include "tsl/platform/protobuf.h"  // IWYU pragma: keep
 #include "tsl/platform/statusor.h"
@@ -123,6 +125,14 @@ ResultAndInserted AddResultToInMemoryCache(const AutotuneCacheKey& key,
   return {it->second, inserted};
 }
 
+// Returns a unique number every time it is called.
+int64_t UniqueId() {
+  static tsl::mutex mu(tsl::LINKER_INITIALIZED);
+  static int64_t id = 0;
+  tsl::mutex_lock l(mu);
+  return ++id;
+}
+
 absl::Status AddResultToFileBasedCacheIfEnabled(const AutotuneCacheKey& key,
                                                 AutotuneResult result,
                                                 std::string_view cache_dir)
@@ -148,7 +158,16 @@ absl::Status AddResultToFileBasedCacheIfEnabled(const AutotuneCacheKey& key,
   // to avoid mingled files when multiple processes are writing to the same
   // file. Also avoids reading incomplete files. (This may not work on all file
   // systems.)
-  std::string temp_file_path = tsl::io::GetTempFilename(".textproto");
+  // Note: tsl::io::GetTempFilename is not intended to work for colossus, thus
+  // we handle creation of cns temporary files manually.
+  std::string temp_file_path;
+  char* tmp_dir = getenv("TMP");
+  if (tmp_dir && std::string_view(tmp_dir).starts_with("/cns")) {
+    temp_file_path =
+        tsl::io::JoinPath(tmp_dir, absl::StrCat(UniqueId(), ".textproto"));
+  } else {
+    temp_file_path = tsl::io::GetTempFilename(".textproto");
+  }
   TF_RETURN_IF_ERROR(
       tsl::WriteStringToFile(default_env, temp_file_path, result_str));
   return default_env->RenameFile(temp_file_path, file_path);
