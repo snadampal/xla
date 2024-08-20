@@ -42,6 +42,8 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_live_range.h"
 #include "xla/service/buffer_value.h"
+#include "xla/service/heap_simulator/allocation_block.h"
+#include "xla/service/heap_simulator/heap_simulator.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_alias_analysis.h"
 #include "xla/service/hlo_buffer.h"
@@ -70,6 +72,245 @@ std::optional<int64_t> GetInstructionIndex(
 }
 
 }  // namespace
+
+void LoopOptimizerBestFitHeap::CreateBufferInterval(
+    AllocationBlock* allocation_block, AllocationBlock* colocated_with) {
+  buffer_intervals_[allocation_block] =
+      BufferInterval({allocation_block,
+                      allocation_block->size,
+                      allocation_block->inclusive_start_time,
+                      allocation_block->end_time,
+                      {},
+                      colocated_with == nullptr});
+  if (colocated_with) {
+    buffer_intervals_[colocated_with].colocations.push_back(allocation_block);
+  }
+}
+
+std::optional<HeapSimulator::Chunk>
+LoopOptimizerBestFitHeap::MaybeFindChunkCandidate(
+    const AllocationBlock* allocation_block, int64_t preferred_offset) {
+  Chunk chunk_candidate =
+      FindChunkCandidate(buffer_intervals_[allocation_block], preferred_offset);
+  if (chunk_candidate.chunk_end() <= size_limit_per_heap_) {
+    return chunk_candidate;
+  }
+  return std::nullopt;
+}
+
+std::optional<HeapSimulator::Chunk>
+LoopOptimizerBestFitHeap::FindAndCommitChunkCandidate(
+    const AllocationBlock* allocation_block, int64_t preferred_offset) {
+  std::optional<Chunk> chunk =
+      MaybeFindChunkCandidate(allocation_block, preferred_offset);
+  if (chunk.has_value()) {
+    CommitChunk(buffer_intervals_[allocation_block], chunk.value());
+  }
+  return chunk;
+}
+
+void LoopOptimizerBestFitHeap::RemoveChunk(int64_t start_time, int64_t end_time,
+                                           Chunk chunk) {
+  CHECK(interval_tree_.Remove(start_time, end_time, chunk));
+}
+
+void LoopOptimizerBestFitHeap::RemoveEvenChunk(
+    int64_t start_time, int64_t end_time,
+    std::optional<HeapSimulator::Chunk>& chunk) {
+  RemoveChunk(start_time, end_time, chunk.value());
+  RemoveChunk(start_time + 2 * loop_size_, end_time + 2 * loop_size_,
+              chunk.value());
+}
+
+void LoopOptimizerBestFitHeap::RemoveOddChunk(
+    int64_t start_time, int64_t end_time,
+    std::optional<HeapSimulator::Chunk>& chunk) {
+  RemoveChunk(start_time + loop_size_, end_time + loop_size_, chunk.value());
+  RemoveChunk(start_time + 3 * loop_size_, end_time + 3 * loop_size_,
+              chunk.value());
+}
+
+void LoopOptimizerBestFitHeap::RemoveEvenOddChunkPair(int64_t start_time,
+                                                      int64_t end_time,
+                                                      EvenOddChunkPair& chunk) {
+  CheckAllocationIntervalValid(start_time, end_time);
+  ShiftAllocationIntervalIfRequired(start_time, end_time);
+  auto [even_chunk, odd_chunk] = chunk;
+  RemoveEvenChunk(start_time, end_time, even_chunk);
+  RemoveOddChunk(start_time, end_time, odd_chunk);
+}
+
+AllocationBlock* LoopOptimizerBestFitHeap::GetAllocationBlock(int64_t begin_idx,
+                                                              int64_t end_idx,
+                                                              int64_t size) {
+  allocation_blocks_.push_back(
+      {begin_idx, end_idx, size, static_cast<int64_t>(-1),
+       static_cast<int64_t>(-1),
+       static_cast<int64_t>(allocation_blocks_.size())});
+  return &allocation_blocks_.back();
+}
+
+AllocationBlock* LoopOptimizerBestFitHeap::CreateEvenAllocationBlock(
+    int64_t begin_idx, int64_t end_idx, int64_t size) {
+  AllocationBlock* first_allocation_block =
+      GetAllocationBlock(begin_idx, end_idx, size);
+  CreateBufferInterval(first_allocation_block);
+  AllocationBlock* second_allocation_block = GetAllocationBlock(
+      begin_idx + 2 * loop_size_, end_idx + 2 * loop_size_, size);
+  CreateBufferInterval(second_allocation_block, first_allocation_block);
+  return first_allocation_block;
+}
+
+AllocationBlock* LoopOptimizerBestFitHeap::CreateOddAllocationBlock(
+    int64_t begin_idx, int64_t end_idx, int64_t size) {
+  AllocationBlock* first_allocation_block =
+      GetAllocationBlock(begin_idx + loop_size_, end_idx + loop_size_, size);
+  CreateBufferInterval(first_allocation_block);
+  AllocationBlock* second_allocation_block = GetAllocationBlock(
+      begin_idx + 3 * loop_size_, end_idx + 3 * loop_size_, size);
+  CreateBufferInterval(second_allocation_block, first_allocation_block);
+  return first_allocation_block;
+}
+
+std::pair<AllocationBlock*, AllocationBlock*>
+LoopOptimizerBestFitHeap::CreateEvenAndOddAllocationBlock(int64_t begin_idx,
+                                                          int64_t end_idx,
+                                                          int64_t size) {
+  return std::make_pair(CreateEvenAllocationBlock(begin_idx, end_idx, size),
+                        CreateOddAllocationBlock(begin_idx, end_idx, size));
+}
+
+void LoopOptimizerBestFitHeap::CheckAllocationIntervalValid(
+    int64_t begin_idx, int64_t end_idx) const {
+  CHECK_LE(begin_idx, end_idx);
+  CHECK_LE(-1 * loop_size_, begin_idx);
+  CHECK_LT(begin_idx, loop_size_);
+  CHECK_LE(0, end_idx);
+  CHECK_LT(end_idx, 2 * loop_size_);
+  CHECK_LE(end_idx - begin_idx + 1, 2 * loop_size_);
+}
+
+void LoopOptimizerBestFitHeap::ShiftAllocationIntervalIfRequired(
+    int64_t& begin_idx, int64_t& end_idx) const {
+  if (begin_idx < 0) {
+    begin_idx += loop_size_;
+    end_idx += loop_size_;
+  }
+}
+
+EvenOddChunkPair LoopOptimizerBestFitHeap::FindEvenAndOddAllocationBetween(
+    int64_t begin_idx, int64_t end_idx, int64_t size,
+    std::pair<int64_t, int64_t> preferred_offsets) {
+  CheckAllocationIntervalValid(begin_idx, end_idx);
+  ShiftAllocationIntervalIfRequired(begin_idx, end_idx);
+  auto [even_offset, odd_offset] = preferred_offsets;
+  auto [even_allocation, odd_allocation] =
+      CreateEvenAndOddAllocationBlock(begin_idx, end_idx, size);
+  // We need to commit the even chunk because even and odd chunks might overlap
+  // in time.
+  std::optional<HeapSimulator::Chunk> even_chunk =
+      FindAndCommitChunkCandidate(even_allocation, even_offset);
+  if (!even_chunk.has_value()) {
+    return {std::nullopt, std::nullopt};
+  }
+  std::optional<HeapSimulator::Chunk> odd_chunk =
+      MaybeFindChunkCandidate(odd_allocation, odd_offset);
+  RemoveEvenChunk(begin_idx, end_idx, even_chunk);
+  if (odd_chunk.has_value()) {
+    return {even_chunk, odd_chunk};
+  }
+  return {std::nullopt, std::nullopt};
+}
+
+EvenOddChunkPair LoopOptimizerBestFitHeap::AllocateEvenAndOddBetween(
+    int64_t begin_idx, int64_t end_idx, int64_t size,
+    std::pair<int64_t, int64_t> preferred_offsets) {
+  CheckAllocationIntervalValid(begin_idx, end_idx);
+  ShiftAllocationIntervalIfRequired(begin_idx, end_idx);
+  auto [even_offset, odd_offset] = preferred_offsets;
+  auto [even_allocation, odd_allocation] =
+      CreateEvenAndOddAllocationBlock(begin_idx, end_idx, size);
+  // We need to commit the even chunk because even and odd chunks might overlap
+  // in time.
+  std::optional<HeapSimulator::Chunk> even_chunk =
+      FindAndCommitChunkCandidate(even_allocation, even_offset);
+  if (!even_chunk.has_value()) {
+    return {std::nullopt, std::nullopt};
+  }
+  std::optional<HeapSimulator::Chunk> odd_chunk =
+      FindAndCommitChunkCandidate(odd_allocation, odd_offset);
+  if (odd_chunk.has_value()) {
+    return {even_chunk, odd_chunk};
+  }
+  RemoveEvenChunk(begin_idx, end_idx, even_chunk);
+  return {std::nullopt, std::nullopt};
+}
+
+AllocationBlock* LoopOptimizerBestFitHeap::CreateAllocationBlock(
+    int64_t begin_idx, int64_t end_idx, int64_t size) {
+  AllocationBlock* first_allocation_block =
+      GetAllocationBlock(begin_idx, end_idx, size);
+  CreateBufferInterval(first_allocation_block);
+  AllocationBlock* second_allocation_block = GetAllocationBlock(
+      begin_idx + 1 * loop_size_, end_idx + 1 * loop_size_, size);
+  CreateBufferInterval(second_allocation_block, first_allocation_block);
+  AllocationBlock* third_allocation_block = GetAllocationBlock(
+      begin_idx + 2 * loop_size_, end_idx + 2 * loop_size_, size);
+  CreateBufferInterval(third_allocation_block, first_allocation_block);
+  AllocationBlock* fourth_allocation_block = GetAllocationBlock(
+      begin_idx + 3 * loop_size_, end_idx + 3 * loop_size_, size);
+  CreateBufferInterval(fourth_allocation_block, first_allocation_block);
+  return first_allocation_block;
+}
+
+EvenOddChunkPair LoopOptimizerBestFitHeap::FindAllocationBetween(
+    int64_t begin_idx, int64_t end_idx, int64_t size,
+    int64_t preferred_offset) {
+  CheckAllocationIntervalValid(begin_idx, end_idx);
+  ShiftAllocationIntervalIfRequired(begin_idx, end_idx);
+  // An allocation that is colocated in even and odd iterations cannot be double
+  // buffered i.e. it should span less than or equal to one loop iteration).
+  CHECK_LE(end_idx - begin_idx + 1, loop_size_);
+  auto allocation = CreateAllocationBlock(begin_idx, end_idx, size);
+  std::optional<HeapSimulator::Chunk> chunk =
+      MaybeFindChunkCandidate(allocation, preferred_offset);
+  return {chunk, chunk};
+}
+
+EvenOddChunkPair LoopOptimizerBestFitHeap::AllocateBetween(
+    int64_t begin_idx, int64_t end_idx, int64_t size,
+    int64_t preferred_offset) {
+  CheckAllocationIntervalValid(begin_idx, end_idx);
+  ShiftAllocationIntervalIfRequired(begin_idx, end_idx);
+  // An allocation that is colocated in even and odd iterations cannot be double
+  // buffered i.e. it should span less than or equal to one loop iteration).
+  CHECK_LE(end_idx - begin_idx + 1, loop_size_);
+  auto allocation = CreateAllocationBlock(begin_idx, end_idx, size);
+  std::optional<HeapSimulator::Chunk> chunk =
+      FindAndCommitChunkCandidate(allocation, preferred_offset);
+  return {chunk, chunk};
+}
+
+std::string LoopOptimizerBestFitHeap::MemoryUsageToAsciiArt(
+    int64_t begin_iteration_idx, int64_t end_iteration_idx) const {
+  CHECK_LE(0, begin_iteration_idx);
+  CHECK_LE(begin_iteration_idx, end_iteration_idx);
+  return interval_tree_.NodesOverlappingInTimeToAsciiArt(
+      loop_size_ * begin_iteration_idx,
+      loop_size_ * (end_iteration_idx + 1) - 1, loop_size_);
+}
+
+std::vector<int64_t> LoopOptimizerBestFitHeap::RemainingMemoryByTime() const {
+  // Only 2nd and 3rd iterations have the correct (and identical) memory usage.
+  // 1st and 4th iterations serve only to model the boundary conditions.
+  std::vector<int64_t> memory_used_by_time =
+      interval_tree_.MemoryUsedInInterval(loop_size_ * 2, loop_size_ * 3 - 1);
+  std::vector<int64_t> remaining_memory_by_time(loop_size_);
+  for (int i = 0; i < loop_size_; ++i) {
+    remaining_memory_by_time[i] = size_limit_per_heap_ - memory_used_by_time[i];
+  }
+  return remaining_memory_by_time;
+}
 
 /*static*/ absl::StatusOr<std::unique_ptr<MemoryBoundLoopOptimizer>>
 MemoryBoundLoopOptimizer::Create(

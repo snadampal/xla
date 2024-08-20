@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_SERVICE_MEMORY_SPACE_ASSIGNMENT_MEMORY_BOUND_LOOP_OPTIMIZER_H_
 
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -30,6 +31,8 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/utils/hlo_live_range.h"
 #include "xla/service/buffer_value.h"
+#include "xla/service/heap_simulator/allocation_block.h"
+#include "xla/service/heap_simulator/heap_simulator.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_alias_analysis.h"
 #include "xla/service/hlo_buffer.h"
@@ -43,6 +46,141 @@ limitations under the License.
 
 namespace xla {
 namespace memory_space_assignment {
+
+// Pair of chunks for even and odd loop iterations.
+using EvenOddChunkPair = std::pair<std::optional<HeapSimulator::Chunk>,
+                                   std::optional<HeapSimulator::Chunk>>;
+
+// LoopOptimizerBestFitHeap extends GlobalDecreasingSizeBestFitHeap to track the
+// allocated buffers and their live intervals for the MemoryBoundLoopOptimizer.
+// It models the heap for 4 loop iterations [0, loop_size), [loop_size,
+// 2*loop_size), [2*loop_size, 3*loop_size) and [3*loop_size, 4*loop_size). 0th
+// iteration [0, loop_size) and 2nd iteration [2*loop_size, 3*loop_size) are
+// considered EvenIterations. 1st iteration [loop_size, 2*loop_size) and 3rd
+// iteration [3*loop_size, 4*loop_size) are considered OddIterations. An
+// allocation is required to have the same offset(colocated) in the even
+// iterations and the odd iterations. The even offset and the odd offsets may be
+// different. A buffer can span at most 2 loop iterations, which means that a
+// buffer from iteration 0 can span till iteration 2 and a buffer from iteration
+// 1 can span till iteration 3. The 0th and the 1st iterations are just to
+// account for loop around for buffers that go across one or two loop
+// boundaries. The 2nd and the 3rd iterations present the actual memory view of
+// the allocation.
+class LoopOptimizerBestFitHeap
+    : public GlobalDecreasingSizeBestFitHeap<AllocationBlock> {
+ public:
+  explicit LoopOptimizerBestFitHeap(uint64_t size_limit_per_heap,
+                                    int64_t loop_size,
+                                    int64_t alignment_in_bytes)
+      : GlobalDecreasingSizeBestFitHeap<AllocationBlock>(alignment_in_bytes),
+        size_limit_per_heap_(size_limit_per_heap),
+        loop_size_(loop_size) {}
+  ~LoopOptimizerBestFitHeap() override = default;
+
+  // Frees the memory space denoted by chunk from [start_time, end_time] from
+  // the even and odd loop iterations.
+  void RemoveEvenOddChunkPair(int64_t start_time, int64_t end_time,
+                              EvenOddChunkPair& chunk);
+
+  // Displays the current memory usage vs time for 6 loop iterations by default.
+  // Note: The 0th and the 1st iterations are just to account for loop around
+  // for buffers that go across one or two loop boundaries. The 2nd and the 3rd
+  // iterations present the actual memory view of the allocation. The 4th and
+  // 5th iterations show buffers from previous two iterations that go across one
+  // or two loop boundaries. begin_iteration_idx and end_iteration_idx are both
+  // inclusive, 0 indexed.
+  std::string MemoryUsageToAsciiArt(int64_t begin_iteration_idx = 0,
+                                    int64_t end_iteration_idx = 5) const;
+
+  // Returns a vector of size loop_size, where the i'th element denotes the
+  // available(unfragmented) alternate memory in bytes at loop_idx i.
+  std::vector<int64_t> RemainingMemoryByTime() const;
+
+  // Finds free memory chunks of size "size" between [begin_idx, end_idx] in the
+  // even and odd loop iterations only if free chunks are found in both
+  // iterations. The even and odd iteration offets may be different.
+  EvenOddChunkPair FindEvenAndOddAllocationBetween(
+      int64_t begin_idx, int64_t end_idx, int64_t size,
+      std::pair<int64_t, int64_t> preferred_offsets = {-1, -1});
+
+  // Finds and reserves free memory chunks of size "size" between [begin_idx,
+  // end_idx] in the even and odd loop iterations only if free chunks are found
+  // in both iterations. The even and odd iteration offets may be different.
+  EvenOddChunkPair AllocateEvenAndOddBetween(
+      int64_t begin_idx, int64_t end_idx, int64_t size,
+      std::pair<int64_t, int64_t> preferred_offsets = {-1, -1});
+
+  // Finds free memory chunks of size "size" between [begin_idx,
+  // end_idx] in the even and odd loop iterations only if free chunks are found
+  // in both iterations. The even and odd iteration offets are same.
+  EvenOddChunkPair FindAllocationBetween(int64_t begin_idx, int64_t end_idx,
+                                         int64_t size,
+                                         int64_t preferred_offset = -1);
+
+  // Finds and reserves free memory chunks of size "size" between [begin_idx,
+  // end_idx] in the even and odd loop iterations only if free chunks are found
+  // in both iterations. The even and odd iteration offets are same.
+  EvenOddChunkPair AllocateBetween(int64_t begin_idx, int64_t end_idx,
+                                   int64_t size, int64_t preferred_offset = -1);
+
+ private:
+  // Allocation interval [begin_idx, end_idx] is valid if -
+  // begin_idx <= end_idx
+  // begin_idx is within [-loop_size loop_size)
+  // end_idx is within [0, 2 * loop_size)
+  // end_idx - begin_idx + 1 <= 2 * loop_size [allocation colocated in even(or
+  // odd) iterations cannot span more than 2 loop iterations]
+  void CheckAllocationIntervalValid(int64_t begin_idx, int64_t end_idx) const;
+
+  // Shifts [begin_idx, end_idx] to [begin_idx+loop_size, end_idx+loop_size] if
+  // begin_idx is negative.
+  void ShiftAllocationIntervalIfRequired(int64_t& begin_idx,
+                                         int64_t& end_idx) const;
+
+  // Returns pointer to a newly created allocation block.
+  AllocationBlock* GetAllocationBlock(int64_t begin_idx, int64_t end_idx,
+                                      int64_t size);
+
+  void CreateBufferInterval(AllocationBlock* allocation_block,
+                            AllocationBlock* colocated = nullptr);
+
+  std::optional<Chunk> MaybeFindChunkCandidate(
+      const AllocationBlock* allocation_block, int64_t preferred_offset = -1);
+
+  std::optional<Chunk> FindAndCommitChunkCandidate(
+      const AllocationBlock* allocation_block, int64_t preferred_offset = -1);
+
+  void RemoveChunk(int64_t start_time, int64_t end_time, Chunk chunk);
+
+  void RemoveEvenChunk(int64_t start_time, int64_t end_time,
+                       std::optional<HeapSimulator::Chunk>& chunk);
+
+  void RemoveOddChunk(int64_t start_time, int64_t end_time,
+                      std::optional<HeapSimulator::Chunk>& chunk);
+
+  // Creates 4 colocated allocation blocks for even and odd iterations and
+  // returns one AllocationBlock.
+  AllocationBlock* CreateAllocationBlock(int64_t begin_idx, int64_t end_idx,
+                                         int64_t size);
+
+  // Creates 2 colocated allocation blocks for even iterations and returns one
+  // AllocationBlock.
+  AllocationBlock* CreateEvenAllocationBlock(int64_t begin_idx, int64_t end_idx,
+                                             int64_t size);
+  // Creates 2 colocated allocation blocks for odd iterations and returns one
+  // AllocationBlock.
+  AllocationBlock* CreateOddAllocationBlock(int64_t begin_idx, int64_t end_idx,
+                                            int64_t size);
+
+  // Creates 2 colocated allocation blocks for each even and odd iterations
+  // and returns one from each.
+  std::pair<AllocationBlock*, AllocationBlock*> CreateEvenAndOddAllocationBlock(
+      int64_t begin_idx, int64_t end_idx, int64_t size);
+
+  uint64_t size_limit_per_heap_;
+  int64_t loop_size_;
+  std::list<AllocationBlock> allocation_blocks_;
+};
 
 // An optimizer for unrolled memory-bound loops. It keeps track of alternate
 // memory capacity and default memory bandwidth to decide the allocations of
