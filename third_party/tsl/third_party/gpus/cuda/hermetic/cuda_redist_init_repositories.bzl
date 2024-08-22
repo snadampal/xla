@@ -112,9 +112,11 @@ def get_lib_name_to_version_dict(repository_ctx):
             lib_name_to_version_dict[minor_version_key] = lib_version
             if major_version_key not in lib_name_to_version_dict:
                 lib_name_to_version_dict[major_version_key] = lib_version
-        if (len(lib_version.split(".")) == 3 and
-            minor_version_key not in lib_name_to_version_dict):
-            lib_name_to_version_dict[minor_version_key] = lib_version
+        if len(lib_version.split(".")) == 3:
+            if major_version_key not in lib_name_to_version_dict:
+                lib_name_to_version_dict[major_version_key] = lib_version
+            if minor_version_key not in lib_name_to_version_dict:
+                lib_name_to_version_dict[minor_version_key] = lib_version
     return lib_name_to_version_dict
 
 def create_dummy_build_file(repository_ctx, use_comment_symbols = True):
@@ -294,6 +296,8 @@ def _use_downloaded_cuda_redistribution(repository_ctx):
         lib_name_to_version_dict,
         major_version,
     )
+    if repository_ctx.name == "cuda_cuda":
+        repository_ctx.symlink("lib/libcuda.so.{}".format(lib_name_to_version_dict["%{libcuda_version}"]), "lib/libcuda.so.1")
     repository_ctx.file("version.txt", major_version)
 
 def _cuda_repo_impl(repository_ctx):
